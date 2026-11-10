@@ -524,7 +524,7 @@ h1{font-family:var(--font-display); font-weight:400; font-size:clamp(46px,9vw,88
       if(d.z)state.zahra.days=sanitize(d.z);
     }catch(e){}
   }
-  var writing={}, pending={}, dirty={}, timers={}, seeded={};
+  var db=null, blocked=false, writing={}, pending={}, dirty={}, timers={}, seeded={}, gotDef={};
   function setSync(k){
     var el=document.getElementById('sync');
     var t={
@@ -538,52 +538,49 @@ h1{font-family:var(--font-display); font-weight:400; font-size:clamp(46px,9vw,88
     el.textContent=t[k]||'';
   }
   function queueCloud(rid){
-    if(!cloudCode)return;
+    if(!db||blocked)return;
     dirty[rid]=true; clearTimeout(timers[rid]);
     timers[rid]=setTimeout(function(){flush(rid,0)},500);
   }
   function flush(rid,attempt){
     if(writing[rid]){pending[rid]=true;return}
     writing[rid]=true; pending[rid]=false;
-    fetch('/api/tracker',{method:'PUT',headers:{'Content-Type':'application/json','Authorization':'Bearer '+cloudCode},body:JSON.stringify({id:rid,days:state[rid].days.slice()})}).then(function(res){
-      if(!res.ok)throw new Error('HTTP '+res.status);
+    db.doc('readers/'+rid).set({days:state[rid].days.slice(),updated:Date.now()}).then(function(){
       dirty[rid]=false; writing[rid]=false; setSync('ok');
       if(pending[rid])flush(rid,0);
     }).catch(function(e){
       writing[rid]=false;
-      if(attempt<1){setTimeout(function(){flush(rid,attempt+1)},900);return}
-      setSync('error');
+      var code=e&&e.code;
+      if(code==='unavailable'&&attempt<1){setTimeout(function(){flush(rid,attempt+1)},800+Math.random()*700);return}
+      if(code==='invalid_argument'){blocked=true;setSync('readonly')}else setSync('error');
     });
   }
-  var cloudCode=null;
-  function syncFromCloud(first){
-    if(!cloudCode)return;
-    fetch('/api/tracker',{headers:{'Authorization':'Bearer '+cloudCode},cache:'no-store'}).then(function(res){
-      if(!res.ok)throw new Error('HTTP '+res.status);
-      return res.json();
-    }).then(function(data){
-      var changed=false;
-      ['mohammad','zahra'].forEach(function(rid){
-        if(data[rid]&&Array.isArray(data[rid].days)){
-          seeded[rid]=true;
-          if(!dirty[rid]&&!writing[rid]){state[rid].days=sanitize(data[rid].days);changed=true}
-        }else if(first&&!seeded[rid]){
-          seeded[rid]=true;
-          if(sum(state[rid].days)>0)flush(rid,0);
+  function subscribe(rid){
+    db.doc('readers/'+rid).onSnapshot(function(snap){
+      if(!snap.metadata.fromCache){gotDef[rid]=true; clearTimeout(slowTimer)}
+      if(snap.exists){
+        var d=snap.data();
+        if(d&&Array.isArray(d.days)&&!dirty[rid]&&!writing[rid]){
+          state[rid].days=sanitize(d.days); localSave(); render();
         }
-      });
-      if(changed){localSave();render()}
-      setSync('ok');
-    }).catch(function(){setSync('error')});
+        if(gotDef[rid])setSync(blocked?'readonly':'ok');
+      }else if(!snap.metadata.fromCache&&!seeded[rid]){
+        seeded[rid]=true;
+        if(sum(state[rid].days)>0)flush(rid,0);
+        setSync(blocked?'readonly':'ok');
+      }
+    },function(){setSync('local')});
   }
+  var slowTimer=null;
   function initCloud(){
-    try{cloudCode=localStorage.getItem('daktash-tracker-access-code')}catch(e){}
-    if(!cloudCode)cloudCode=window.prompt('Enter the shared tracker access code:');
-    if(!cloudCode){setSync('local');return}
-    try{localStorage.setItem('daktash-tracker-access-code',cloudCode)}catch(e){}
-    setSync('connecting');
-    syncFromCloud(true);
-    setInterval(function(){syncFromCloud(false)},15000);
+    var p=null;
+    try{ if(window.claude&&window.claude.use)p=window.claude.use('db') }catch(e){}
+    slowTimer=setTimeout(function(){setSync('slow')},10000);
+    if(!p){clearTimeout(slowTimer);setSync('local');return}
+    p.then(function(d){
+      if(!d){clearTimeout(slowTimer);setSync('local');return}
+      db=d; subscribe('mohammad'); subscribe('zahra');
+    }).catch(function(){clearTimeout(slowTimer);setSync('local')});
   }
 
   /* ---------- edits ---------- */
